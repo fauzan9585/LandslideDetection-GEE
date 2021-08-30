@@ -1,0 +1,146 @@
+//Code Written by Fauzan Muzakki, ITC, University of Twente
+//Internship at Arizona State University 2021
+//This code inspired by Muhammad Aufaristama 
+
+////////////////////////////////////////////////////////////////////////
+//Sentinel 2 retrieval
+////////////////////////////////////////////////////////////////////////
+//Zoom in to the study area
+Map.centerObject(JapanAOI, 11);
+
+//cloudmasking Sentinel 2
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image.updateMask(mask).divide(10000);
+}
+
+var pre_event_s2 = Sentinel2.filterDate ('2016-05-01', '2016-09-30')
+                  .filterMetadata("CLOUDY_PIXEL_PERCENTAGE", "less_than", 5)
+                  .filterBounds(JapanAOI)
+                  .map(maskS2clouds)
+                  .map(addindices)
+                  .map(threshold)
+                  //.median()
+                  print(pre_event_s2, 'total_image_pre' )
+
+var post_event_s2 = Sentinel2.filterDate('2018-09-01', '2018-10-30')
+                   .filterMetadata("CLOUDY_PIXEL_PERCENTAGE", "less_than", 5)
+                   .filterBounds(JapanAOI)
+                   .map(maskS2clouds)
+                   .map(addindices)
+                   .map(threshold)
+                  //.median()
+                   print(post_event_s2, 'total_image_post' )
+                  
+var full_event_s2 = Sentinel2.filterDate('2015-01-01', '2021-12-30')
+                   // .filterMetadata("CLOUDY_PIXEL_PERCENTAGE","less_than", 5)
+                    .filterBounds(JapanAOI)
+                    //.map(maskS2clouds)
+                    .map(addindices)
+                    .map(threshold)
+                   // .median()
+                    print(full_event_s2, 'total_image_full' )
+                  
+            
+var visualization = {
+  min: 0.0,
+  max: 0.5,
+  bands: ['B4', 'B3', 'B2'],
+  
+
+////////////////////////////////////////////////////////////////////////
+//Features Extraction
+////////////////////////////////////////////////////////////////////////
+//DEM Extraction 
+var elevation = SRTM.select('elevation')
+.clip(JapanAOI)
+var terrain = ee.Terrain.products(elevation)
+function threshold(image) {  
+  var slope = terrain.select('slope')
+  var thres = slope.gte(8).rename('thres')
+  
+  return image.addBands(thres);
+}
+
+var slope = terrain.select('slope')
+
+function addindices(image) {
+  var params= {'NIR':image.select('B8'),
+      'RED':image.select('B4'),
+      'BLUE':image.select('B2'),
+      'SWIR':image.select('B11'),
+      'GREEN': image.select('B3') }
+  var ndvi =  image.normalizedDifference(['B8', 'B4']).rename(['ndvi'])
+  //var rendvi = image.normalizedDifference(['B8', 'B7']).rename(['rendvi'])
+  var ndwi = image.normalizedDifference(['B8','B11']).rename(['ndwi'])
+  var evi = image.expression('2.5 * ((NIR-RED) / (NIR +6 * RED -7.5* BLUE+1))', params).rename(['evi'])
+  //var evi2 = image.expression ('2.5 * ((NIR-RED))/((NIR+2.4*RED+1))').rename(['evi2'])
+  //var savi = image.expression('1.5*((NIR-RED))/((NIR+RED+0.5))').rename(['savi'])
+  var bsi = image.expression('((SWIR+RED)-(NIR+BLUE))/((SWIR+RED)+(NIR+BLUE))', params).rename(['bsi'])
+  var br  = image.expression ('RED/(RED+GREEN+BLUE)', params).rename(['br'])
+
+  return image.addBands(evi).addBands(ndwi).addBands(bsi).addBands(br).addBands(ndvi)//.addBands(rendvi);
+}
+
+
+////////////////////////////////////////////////////////////////////////
+//Change Detection
+////////////////////////////////////////////////////////////////////////
+var change_detection = post_event_s2.median() .subtract(pre_event_s2.median()) // the visualization of change compared before and after landslide 
+var change_ratio =change_detection.divide(pre_event_s2.median()) //the proportion of change caused by landslide 
+
+var cndvi = change_ratio.select('ndvi')
+var cbr = change_ratio.select('br')
+var cbsi = change_ratio.select('bsi')
+var ndvi = post_event_s2.max().select('ndvi')
+var br= post_event_s2.max().select('br')
+var bsi = post_event_s2.max().select('bsi')
+
+/Assigning thresholds based on vegetation indices to map bare land (landslide) 
+var landslide_s = bsi.gt(-0.29).and(bsi.lt(0.27).and(ndvi.gt(0.08).and(ndvi.lt(0.57))).and(br.gt(0.30).and(br.lt(0.43))).and(slope.gte(8))).selfMask(); //post-event mapping (Inspired by Aufar)
+var landslide_t =  cbsi.gt(-3.47).and(cbsi.lt(0.02).and(cndvi.gt(-1.035).and(cndvi.lt(-0.02))).and(cbr.gt(-0.08).and(cbr.lt(1.27))).and(slope.gte(8))).selfMask(); //land cover change-based landslide mapping
+var landslide = landslide_s.and(landslide_t)
+
+//Visualization
+Map.addLayer(pre_event_s2.median().clip(JapanAOI), visualization, 'pre event');
+Map.addLayer(post_event_s2.median().clip(JapanAOI), visualization, 'post event');
+Map.addLayer(full_event_s2.median().clip(JapanAOI), visualization, 'full event')
+Map.addLayer(Japan,{color: 'FFFF00'}, 'Landslide Iburi 2018')
+Map.addLayer(change_ratio.clip(JapanAOI), {}, 'change');
+
+
+////////////////////////////////////////////////////////////////////////
+//Convert Raster to Vector
+////////////////////////////////////////////////////////////////////////
+var inventories_fusion= landslide.reduceToVectors({
+  geometry: JapanAOI,
+  scale: 10,
+  geometryType: 'polygon',
+  eightConnected: false,
+  labelProperty: 'zone',
+  maxPixels: 1e8
+});
+
+////////////////////////////////////////////////////////////////////////
+//Download
+////////////////////////////////////////////////////////////////////////
+
+Export.image.toDrive({
+  image: change_ratio.select(['bsi', 'br', 'ndvi']), 
+  description: 'change_ratio',
+  folder: 'Landslide_Aufar',
+  region: JapanAOI,                
+  scale: 10
+})
+
+
+

@@ -1,0 +1,150 @@
+//Code Written by Fauzan Muzakki, ITC, University of Twente
+//Internship at Arizona State University 2021
+
+//Zoom in to the study area
+Map.centerObject(Iburi, 11)
+
+//DEM Extraction
+var elevation = SRTM.select('elevation')
+.clip(JapanAOI)
+var terrain = ee.Terrain.products(elevation)
+function threshold(image) {  
+  var slope = terrain.select('slope')
+  var thres = slope.gte(8).rename('thres')
+  
+  return image.addBands(thres);
+}
+
+var slope = terrain.select('slope')
+
+//cloudmasking Sentinel 2
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image.updateMask(mask).divide(10000);
+}
+
+//map vegetation indices
+function addindices(image) {
+  var params= {'NIR':image.select('B8'),
+      'RED':image.select('B4'),
+      'BLUE':image.select('B2'),
+      'SWIR':image.select('B11'),
+      'GREEN': image.select('B3') }
+  var ndvi =  image.normalizedDifference(['B8', 'B4']).rename(['ndvi'])
+  var bsi = image.expression('((SWIR+RED)-(NIR+BLUE))/((SWIR+RED)+(NIR+BLUE))', params).rename(['bsi'])
+  var br  = image.expression ('RED/(RED+GREEN+BLUE)', params).rename(['br'])
+  var ndwi = image.normalizedDifference(['B8', 'B3']).rename(['ndwi'])
+  
+  return image.addBands(ndvi).addBands(bsi).addBands(br).addBands(ndwi);
+
+}
+
+////////////////////////////////////////////
+//image collection Sentinel 2
+/////////////////////////////////////////////
+var pre_event_s2 = Sentinel2.filterDate ('2016-05-01', '2016-09-30')
+                  .filterMetadata("CLOUDY_PIXEL_PERCENTAGE", "less_than", 5)
+                  .filterBounds(JapanAOI)
+                  .map(maskS2clouds)
+                  .map(addindices)
+                  .map(threshold)
+                  //.median()
+                  print(pre_event_s2, 'total_image_pre' )
+
+var post_event_s2 = Sentinel2.filterDate('2018-09-01', '2018-10-30')
+                   .filterMetadata("CLOUDY_PIXEL_PERCENTAGE", "less_than", 5)
+                   .filterBounds(JapanAOI)
+                   .map(maskS2clouds)
+                   .map(addindices)
+                   .map(threshold)
+                   //.median()
+                   print(post_event_s2, 'total_image_post' )
+
+var visualization = {
+  min: 0.0,
+  max: 0.5,
+  bands: ['B4', 'B3', 'B2'],
+}
+
+//////////////////////////////////////////////////////////////////
+//Change Detection
+//////////////////////////////////////////////////////////////////
+var change_detection = post_event_s2.median().subtract(pre_event_s2.median()) // the visualization of change compared before and after landslide 
+var change_ratio =change_detection.divide(pre_event_s2.median()) //the proportion of change caused by landslide 
+
+//////////////////////////////////////////////////////////////////
+//Change Detection
+//////////////////////////////////////////////////////////////////
+var change_detection = post_event_s2.median().subtract(pre_event_s2.median()) // the visualization of change compared before and after landslide 
+var change_ratio =change_detection.divide(pre_event_s2.median()) //the proportion of change caused by landslide 
+
+//////////////////////////////////////////////////////////////
+///Random Forest
+/////////////////////////////////////////////////////////////
+
+///Samples preparation 
+
+//Assigning a property as numeric value ('class') to landslide and non landslide class
+var landslide = ee.FeatureCollection.randomPoints(Iburi, 500)
+    .map(function(f){
+      return f.set('class',1)
+    })
+print(landslide.first())
+
+var nonlandslide = ee.FeatureCollection.randomPoints(outlandslide, 3000)
+    .map(function(f){
+      return f.set('class',0)
+    })
+print(nonlandslide.first())
+
+var samples = landslide.merge(nonlandslide) //merging two samples
+print(samples)
+
+/////Random Forest Classification
+var bands1 = ['ndvi', 'bsi', 'br']
+var detailAOI = change_ratio.clip(JapanAOI2)
+
+var training = change_ratio.select(bands1).sampleRegions({
+ collection : samples,
+ properties : ['class'],
+ scale :10
+})
+
+var classifier = ee.Classifier.smileRandomForest(500).train({
+  features : training,
+  classProperty : 'class',
+  inputProperties : bands1
+})
+
+var classified = detailAOI.select(bands1).classify(classifier)
+
+
+////////////////////////////
+Download
+//////////////////////////////
+Export.image.toDrive({
+  image: classified, 
+  description: 'RF classfied',
+  folder: 'Landslide_Aufar',
+  region: JapanAOI,                 
+  scale: 10,
+  maxPixels : 1e8
+})
+
+}) 
+
+//////////////////////////////////////////////
+//Data Visualization
+/////////////////////////////////////////////
+Map.addLayer(change_ratio.clip(JapanAOI2), {}, 'change');
+Map.addLayer(classified, {min : 0 , max: 1 ,pallete:['red','blue']}, 'RFresult')
+
